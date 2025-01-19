@@ -1,109 +1,226 @@
-import os
-from typing import Optional
+from __future__ import annotations
+
+# Standard library
+from dataclasses import dataclass
 import logging
-from aiogram import Bot, Dispatcher, types
-from openai import OpenAI
+import asyncio
+import os
+import sys
+from typing import List
+
+# Aiogram
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.utils.token import TokenValidationError
+
+# Third party
+from openai import AsyncOpenAI
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
+import logfire
+from pydantic_ai.tools import RunContext
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
 logger = logging.getLogger(__name__)
+logfire.configure(send_to_logfire='if-token-present')
 
 # Load environment variables
 load_dotenv()
 
+# Validate required environment variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not all([TELEGRAM_TOKEN, OPENAI_KEY, SUPABASE_URL, SUPABASE_KEY]):
+    logger.error("Missing required environment variables!")
+    sys.exit(1)
+
+# Initialize model
+llm = os.getenv('LLM_MODEL', 'gpt-4o-mini')
+model = OpenAIModel(llm)
+
+@dataclass
+class PydanticAIDeps:
+    supabase: Client
+    openai_client: AsyncOpenAI
+
+system_prompt = """
+Ты - ассистент, который помогает находить информацию в истории чата. У тебя есть доступ к базе данных с историей сообщений, их саммари и метаданными.
+
+Твоя задача - находить релевантную информацию и давать полезные ответы на вопросы пользователя.
+
+Когда отвечаешь:
+1. ОБЯЗАТЕЛЬНО цитируй найденные сообщения в формате:
+   ```
+   [Дата],[Имя]: "точная цитата из сообщения"
+   ```
+2. Если нашел несколько упоминаний - приведи все
+3. Указывай контекст до и после цитаты
+4. Если информации нет - честно скажи об этом
+
+Отвечай на русском языке, кратко и по делу.
+"""
+
 # Initialize clients
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL", ""),
-    os.getenv("SUPABASE_KEY", "")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+openai_client = AsyncOpenAI(api_key=OPENAI_KEY)
+
+# Initialize router
+router = Router(name=__name__)
+
+chat_assistant = Agent(
+    model,
+    system_prompt=system_prompt,
+    deps_type=PydanticAIDeps,
+    retries=2
 )
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN", ""))
-dp = Dispatcher(bot)
 
-async def get_embedding(text: str) -> Optional[list[float]]:
+@chat_assistant.tool
+async def search_chat_history(ctx: RunContext[PydanticAIDeps], query: str) -> str:
+    """
+    Ищет релевантные сообщения в истории чата используя гибридный поиск (BM25 + векторный).
+    """
     try:
-        response = openai_client.embeddings.create(
-            model="text-embedding-ada-002",
-            input=text
+        # Создаем несколько вариантов запроса
+        query_variants = [
+            query,  # Оригинальный запрос
+            f"игрушки коллекции {query}",  # Контекст игрушек
+            f"акции магазины {query}",  # Контекст магазинов
+            f"собирать коллекционировать {query}"  # Контекст коллекционирования
+        ]
+        
+        all_results = []
+        seen_dates = set()
+        
+        # Ищем по каждому варианту запроса
+        for query in query_variants:
+            # Используем openai_client из контекста
+            response = await ctx.deps.openai_client.embeddings.create(
+                model="text-embedding-3-small",
+                input=query
+            )
+            query_embedding = response.data[0].embedding
+            
+            # Используем supabase из контекста
+            matches = ctx.deps.supabase.rpc(
+                'hybrid_search',
+                {
+                    'text_query': query,
+                    'query_embedding': query_embedding,
+                    'limit_val': 50
+                }
+            ).execute()
+            
+            if matches.data:
+                for day in matches.data:
+                    if day['date'] not in seen_dates:
+                        seen_dates.add(day['date'])
+                        all_results.append(day)
+
+        if not all_results:
+            return "К сожалению, не удалось найти релевантную информацию по вашему запросу."
+
+        # Сортируем по релевантности
+        all_results.sort(key=lambda x: float(x.get('similarity', 0)), reverse=True)
+        
+        # Форматируем результаты
+        formatted_chunks = []
+        for day in all_results[:30]:  # Берем топ-30
+            date = day['date']
+            title = day.get('title', '')
+            summary = day.get('summary', '')
+            content = day['raw_content']
+            similarity = float(day.get('similarity', 0))
+            
+            # Форматируем с учетом всех полей
+            chunk_text = f"""
+Дата: {date} (релевантность: {similarity:.2f})
+{'Тема: ' + title if title else ''}
+{'Краткое содержание: ' + summary if summary else ''}
+-------------------------------------------
+{content}
+"""
+            formatted_chunks.append(chunk_text)
+            
+        return "\n\n===================\n\n".join(formatted_chunks)
+        
+    except Exception as e:
+        logger.error(f"Error searching chat history: {e}")
+        return f"Ошибка при поиске: {str(e)}"
+
+@router.message(Command("start", "help"))
+async def send_welcome(message: Message):
+    await message.reply("Привет! Я помогу найти информацию в истории чата. Спрашивай что угодно!")
+
+@router.message(F.text)
+async def handle_message(message: Message, bot: Bot) -> None:
+    """
+    Обработчик входящих сообщений.
+    """
+    try:
+        # Создаем зависимости
+        deps = PydanticAIDeps(
+            supabase=supabase,
+            openai_client=openai_client
         )
-        return response.data[0].embedding
-    except Exception as e:
-        logger.error(f"Error getting embedding: {e}")
-        return None
-
-async def search_similar_days(query: str, limit: int = 5) -> list[dict]:
-    try:
-        embedding = await get_embedding(query)
-        if not embedding:
-            return []
         
-        # Using the hybrid search function from the database
-        result = supabase.rpc(
-            'hybrid_search',
-            {
-                'query_text': query,
-                'query_embedding': embedding,
-                'match_count': limit
-            }
-        ).execute()
-        
-        return result.data
-    except Exception as e:
-        logger.error(f"Error searching similar days: {e}")
-        return []
-
-async def generate_response(context: list[dict], query: str) -> str:
-    try:
-        # Prepare context for the model
-        context_text = "\n\n".join([
-            f"Date: {day['date']}\n{day['raw_content']}"
-            for day in context
-        ])
-        
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",  # Using the specified model
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that answers questions based on the provided chat history context."},
-                {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {query}"}
-            ]
+        # Запускаем агента с зависимостями
+        result = await chat_assistant.run(
+            message.text,
+            deps=deps  # Передаем зависимости через deps
         )
         
-        return response.choices[0].message.content
-    except Exception as e:
-        logger.error(f"Error generating response: {e}")
-        return "Sorry, I couldn't generate a response at this time."
-
-@dp.message_handler(commands=['start', 'help'])
-async def send_welcome(message: types.Message):
-    await message.reply("Hi! I'm your chat history assistant. Ask me anything about past conversations!")
-
-@dp.message_handler()
-async def handle_message(message: types.Message):
-    try:
-        # Search for relevant context
-        similar_days = await search_similar_days(message.text)
-        
-        if not similar_days:
-            await message.reply("I couldn't find any relevant information in the chat history.")
-            return
-        
-        # Generate response using the context
-        response = await generate_response(similar_days, message.text)
-        await message.reply(response)
+        # Отправляем ответ
+        await message.answer(result.data)
         
     except Exception as e:
-        logger.error(f"Error handling message: {e}")
-        await message.reply("Sorry, something went wrong. Please try again later.")
+        logger.error(f"Ошибка при обработке сообщения: {e}")
+        await message.answer("Извините, произошла ошибка при обработке вашего сообщения.")
 
-async def main():
+async def main() -> None:
+    # Initialize Bot instance with a default parse mode
+    bot = None
     try:
-        logger.info("Starting bot...")
-        await dp.start_polling()
+        bot_properties = DefaultBotProperties(parse_mode=ParseMode.HTML)
+        bot = Bot(token=TELEGRAM_TOKEN, default=bot_properties)
+        
+        # Initialize Dispatcher
+        dp = Dispatcher()
+        
+        # Register router
+        dp.include_router(router)
+        
+        # Start polling
+        logger.info("Запуск бота...")
+        await dp.start_polling(bot)
+    except TokenValidationError:
+        logger.error("Invalid Telegram token!")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Critical error: {e}")
+        sys.exit(1)
     finally:
-        await bot.session.close()
+        logger.info("Shutting down...")
+        if bot:
+            await bot.session.close()
 
 if __name__ == '__main__':
-    import asyncio
-    asyncio.run(main()) 
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot stopped due to error: {e}")
+        sys.exit(1) 
