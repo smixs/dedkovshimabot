@@ -11,8 +11,8 @@ from typing import List
 # Aiogram
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, ChatType, IS_MEMBER, or_f
+from aiogram.enums import ParseMode, ChatType, MessageEntityType
+from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.utils.token import TokenValidationError
 
@@ -164,32 +164,18 @@ async def search_chat_history(ctx: RunContext[PydanticAIDeps], query: str) -> st
 async def send_welcome(message: Message):
     await message.reply("Привет! Я помогу найти информацию в истории чата. Спрашивай что угодно!")
 
-@router.message(F.text)
-async def handle_message(message: Message, bot: Bot) -> None:
-    # Check if message is in private chat or bot is mentioned/replied to
-    is_private = message.chat.type == "private"
-    is_mentioned = message.mentioned or message.reply_to_message and message.reply_to_message.from_user.id == bot.id
-    
-    if not (is_private or is_mentioned):
-        return
-        
-    try:
-        deps = PydanticAIDeps(
-            supabase=supabase,
-            openai_client=openai_client
-        )
-        result = await chat_assistant.run(message.text, deps=deps)
-        await message.answer(result.data)
-    except Exception as e:
-        logger.exception(f"Error in message handler: {e}")
-        await message.answer("Sorry, something went wrong. Please try again later.")
+# Глобальная переменная для хранения информации о боте
+bot_info = None
 
 async def main() -> None:
+    global bot_info
+    
     # Initialize Bot instance with a default parse mode
-    bot = None
+    bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    
     try:
-        bot_properties = DefaultBotProperties(parse_mode=ParseMode.HTML)
-        bot = Bot(token=TELEGRAM_TOKEN, default=bot_properties)
+        # Получаем информацию о боте один раз при старте
+        bot_info = await bot.get_me()
         
         # Initialize Dispatcher
         dp = Dispatcher()
@@ -198,18 +184,41 @@ async def main() -> None:
         dp.include_router(router)
         
         # Start polling
-        logger.info("Запуск бота...")
         await dp.start_polling(bot)
     except TokenValidationError:
         logger.error("Invalid Telegram token!")
-        sys.exit(1)
+        return
     except Exception as e:
-        logger.error(f"Critical error: {e}")
-        sys.exit(1)
+        logger.error(f"Bot stopped due to error: {e}")
+        return
     finally:
-        logger.info("Shutting down...")
-        if bot:
-            await bot.session.close()
+        await bot.session.close()
+
+@router.message(F.text)
+async def handle_message(message: Message, bot: Bot) -> None:
+    # Простая проверка типа чата
+    if message.chat.type != ChatType.PRIVATE:
+        # В группах проверяем упоминание или ответ
+        is_mentioned = any(
+            entity.type == MessageEntityType.MENTION and 
+            message.text[entity.offset:entity.offset + entity.length] == f"@{bot_info.username}"
+            for entity in (message.entities or [])
+        )
+        
+        is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot.id
+        
+        if not (is_mentioned or is_reply):
+            return
+    
+    try:
+        result = await chat_assistant.run(
+            message.text, 
+            deps=PydanticAIDeps(supabase=supabase, openai_client=openai_client)
+        )
+        await message.answer(result.data)
+    except Exception as e:
+        logger.exception(f"Error: {e}")
+        await message.answer("Sorry, something went wrong.")
 
 if __name__ == '__main__':
     try:
