@@ -12,7 +12,7 @@ from typing import List
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, ChatType, IS_MEMBER, or_f
 from aiogram.types import Message
 from aiogram.utils.token import TokenValidationError
 
@@ -166,28 +166,23 @@ async def send_welcome(message: Message):
 
 @router.message(F.text)
 async def handle_message(message: Message, bot: Bot) -> None:
-    """
-    Обработчик входящих сообщений.
-    """
+    # Check if message is in private chat or bot is mentioned/replied to
+    is_private = message.chat.type == "private"
+    is_mentioned = message.mentioned or message.reply_to_message and message.reply_to_message.from_user.id == bot.id
+    
+    if not (is_private or is_mentioned):
+        return
+        
     try:
-        # Создаем зависимости
         deps = PydanticAIDeps(
             supabase=supabase,
             openai_client=openai_client
         )
-        
-        # Запускаем агента с зависимостями
-        result = await chat_assistant.run(
-            message.text,
-            deps=deps  # Передаем зависимости через deps
-        )
-        
-        # Отправляем ответ
+        result = await chat_assistant.run(message.text, deps=deps)
         await message.answer(result.data)
-        
     except Exception as e:
-        logger.error(f"Ошибка при обработке сообщения: {e}")
-        await message.answer("Извините, произошла ошибка при обработке вашего сообщения.")
+        logger.exception(f"Error in message handler: {e}")
+        await message.answer("Sorry, something went wrong. Please try again later.")
 
 async def main() -> None:
     # Initialize Bot instance with a default parse mode
